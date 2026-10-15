@@ -126,11 +126,17 @@ export { openHealthConnectSettings };
 export type Range = { start: Date; end: Date };
 
 /**
- * Every record of `type` in the range, following page tokens. Ascending by time. `origins` limits the read to those
- * apps' records (Health Connect's dataOriginFilter; see sourcePolicy.ts).
+ * Health Connect's client builds every record it returns with a check that its start is before its end, and throws
+ * "startTime must be before endTime" from inside the native read when one fails it. Some apps (Zepp, among others) write a
+ * zero-length record, so one such record makes the whole read fail, and with it the whole sync.
  */
-export async function readAll<T extends ReadType>(type: T, range: Range, pageSize = 1000, origins?: string[]): Promise<RecordResult<T>[]> {
-  await ensureInitialized();
+const isBadRecordError = (e: unknown) => /startTime must be before endTime/i.test(e instanceof Error ? e.message : String(e));
+
+/** Narrowest window a failing read is split down to; what still fails there is the bad record's own second. */
+const MIN_SPLIT_MS = 1000;
+
+/** One range, every page. */
+async function readPages<T extends ReadType>(type: T, range: Range, pageSize: number, origins?: string[]): Promise<RecordResult<T>[]> {
   const out: RecordResult<T>[] = [];
   let pageToken: string | undefined;
   do {
@@ -146,4 +152,37 @@ export async function readAll<T extends ReadType>(type: T, range: Range, pageSiz
     pageToken = page.pageToken;
   } while (pageToken);
   return out;
+}
+
+/**
+ * readPages, and when the native client rejects a record in the range (isBadRecordError), halves the range and reads each
+ * half. Health Connect gives a record only to the read whose range holds its start, so the halves never overlap and
+ * the records come back once each, in order. Only the window around the bad record is lost: down to MIN_SPLIT_MS, the
+ * unreadable record is skipped and everything else is kept.
+ */
+async function readSplitting<T extends ReadType>(type: T, range: Range, pageSize: number, origins?: string[]): Promise<RecordResult<T>[]> {
+  try {
+    return await readPages(type, range, pageSize, origins);
+  } catch (e) {
+    if (!isBadRecordError(e)) throw e;
+    const span = range.end.getTime() - range.start.getTime();
+    if (span <= MIN_SPLIT_MS) {
+      console.warn(`Health Connect: skipped an unreadable ${type} record starting in ${range.start.toISOString()}`);
+      return [];
+    }
+    const mid = new Date(range.start.getTime() + Math.floor(span / 2));
+    const first = await readSplitting(type, { start: range.start, end: mid }, pageSize, origins);
+    const second = await readSplitting(type, { start: mid, end: range.end }, pageSize, origins);
+    return [...first, ...second];
+  }
+}
+
+/**
+ * Every record of `type` in the range, following page tokens. Ascending by time. `origins` limits the read to those
+ * apps' records (Health Connect's dataOriginFilter; see sourcePolicy.ts). A record the native client can't build
+ * (readSplitting) is skipped, not the whole read.
+ */
+export async function readAll<T extends ReadType>(type: T, range: Range, pageSize = 1000, origins?: string[]): Promise<RecordResult<T>[]> {
+  await ensureInitialized();
+  return readSplitting(type, range, pageSize, origins);
 }
