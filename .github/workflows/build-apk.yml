@@ -1,0 +1,33 @@
+# Builds an installable arm64 APK on GitHub's servers. Run it from the Actions tab (Run workflow).
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ORG_GRADLE_PROJECT_reactNativeArchitectures: arm64-v8a
+      ORG_GRADLE_PROJECT_expo.useLegacyPackaging: "true"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: pnpm install --frozen-lockfile
+      - run: npx expo prebuild --platform android
+      - name: Build release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pulse-mobile-arm64-apk
+          path: android/app/build/outputs/apk/release/*.apk
